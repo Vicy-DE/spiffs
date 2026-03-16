@@ -1040,7 +1040,6 @@ s32_t SPIFFS_fupdate_meta(spiffs *fs, spiffs_file fh, const void *meta) {
 
 spiffs_DIR *SPIFFS_opendir(spiffs *fs, const char *name, spiffs_DIR *d) {
   SPIFFS_API_DBG("%s\n", __func__);
-  (void)name;
 
   if (!SPIFFS_CHECK_CFG((fs))) {
     (fs)->err_code = SPIFFS_ERR_NOT_CONFIGURED;
@@ -1055,6 +1054,33 @@ spiffs_DIR *SPIFFS_opendir(spiffs *fs, const char *name, spiffs_DIR *d) {
   d->fs = fs;
   d->block = 0;
   d->entry = 0;
+  d->seen_dir_count = 0;
+
+  /* Build prefix for directory filtering.
+   * Root ("/", "", NULL) → no prefix, return everything.
+   * Non-root (e.g. "images", "images/") → filter by "images/" prefix. */
+  d->prefix[0] = 0;
+  d->prefix_len = 0;
+
+  if (name && name[0] != '\0' && !(name[0] == '/' && name[1] == '\0')) {
+    const char *p = name;
+    /* Strip leading '/' */
+    while (*p == '/') p++;
+    if (*p != '\0') {
+      u32_t len = (u32_t)strlen(p);
+      if (len >= SPIFFS_DIR_PREFIX_LEN)
+        len = SPIFFS_DIR_PREFIX_LEN - 2;
+      memcpy(d->prefix, p, len);
+      /* Ensure trailing slash */
+      if (d->prefix[len - 1] != '/') {
+        d->prefix[len] = '/';
+        len++;
+      }
+      d->prefix[len] = '\0';
+      d->prefix_len = len;
+    }
+  }
+
   return d;
 }
 
@@ -1109,26 +1135,93 @@ struct spiffs_dirent *SPIFFS_readdir(spiffs_DIR *d, struct spiffs_dirent *e) {
   s32_t res;
   struct spiffs_dirent *ret = 0;
 
-  res = spiffs_obj_lu_find_entry_visitor(d->fs,
-      d->block,
-      d->entry,
-      SPIFFS_VIS_NO_WRAP,
-      0,
-      spiffs_read_dir_v,
-      0,
-      e,
-      &bix,
-      &entry);
-  if (res == SPIFFS_OK) {
+  /* Loop until we find a matching entry or reach the end. */
+  while (1) {
+    res = spiffs_obj_lu_find_entry_visitor(d->fs,
+        d->block,
+        d->entry,
+        SPIFFS_VIS_NO_WRAP,
+        0,
+        spiffs_read_dir_v,
+        0,
+        e,
+        &bix,
+        &entry);
+
+    if (res != SPIFFS_OK) {
+      /* End of iteration or error */
+      if (res != SPIFFS_VIS_END)
+        d->fs->err_code = res;
+      break;
+    }
+
     d->block = bix;
     d->entry = entry + 1;
     e->obj_id &= ~SPIFFS_OBJ_ID_IX_FLAG;
+
+    /* ── Directory emulation: prefix filter ── */
+    const char *fname = (const char *)e->name;
+
+    if (d->prefix_len > 0) {
+      /* Skip entries that don't match the prefix */
+      if (strncmp(fname, (const char *)d->prefix, d->prefix_len) != 0)
+        continue;
+      fname += d->prefix_len;
+    }
+
+    /* Skip entries with empty remaining name */
+    if (fname[0] == '\0')
+      continue;
+
+    /* ── Directory emulation: synthesise sub-dir entries ── */
+    const char *slash = strchr(fname, '/');
+    if (slash != NULL) {
+      u32_t dirlen = (u32_t)(slash - fname);
+      if (dirlen == 0 || dirlen >= SPIFFS_DIR_PREFIX_LEN)
+        continue;
+
+      /* Deduplicate: skip if this directory was already emitted */
+      u8_t dup = 0;
+      u32_t i;
+      for (i = 0; i < d->seen_dir_count; i++) {
+        if (strlen((const char *)d->seen_dirs[i]) == dirlen &&
+            memcmp(d->seen_dirs[i], fname, dirlen) == 0) {
+          dup = 1;
+          break;
+        }
+      }
+      if (dup)
+        continue;
+
+      /* Record this directory name for deduplication */
+      if (d->seen_dir_count < SPIFFS_DIR_MAX_SYNTH_DIRS) {
+        memcpy(d->seen_dirs[d->seen_dir_count], fname, dirlen);
+        d->seen_dirs[d->seen_dir_count][dirlen] = '\0';
+        d->seen_dir_count++;
+      }
+
+      /* Return a synthesised directory entry */
+      memcpy(e->name, fname, dirlen);
+      e->name[dirlen] = '\0';
+      e->type = SPIFFS_TYPE_DIR;
+      e->size = 0;
+      ret = e;
+      break;
+    }
+
+    /* Regular file: strip prefix from the name before returning */
+    if (d->prefix_len > 0) {
+      u32_t nlen = (u32_t)strlen(fname);
+      if (nlen >= SPIFFS_OBJ_NAME_LEN)
+        nlen = SPIFFS_OBJ_NAME_LEN - 1;
+      memmove(e->name, fname, nlen);
+      e->name[nlen] = '\0';
+    }
+    e->type = SPIFFS_TYPE_FILE;
     ret = e;
-  } else if (res == SPIFFS_VIS_END) {
-    // end of iteration
-  } else {
-    d->fs->err_code = res;
+    break;
   }
+
   SPIFFS_UNLOCK(d->fs);
   return ret;
 }
@@ -1138,6 +1231,74 @@ s32_t SPIFFS_closedir(spiffs_DIR *d) {
   SPIFFS_API_CHECK_CFG(d->fs);
   SPIFFS_API_CHECK_MOUNT(d->fs);
   return 0;
+}
+
+/* Directories are implicit in SPIFFS flat namespace — mkdir is a no-op. */
+s32_t SPIFFS_mkdir(spiffs *fs, const char *path) {
+  SPIFFS_API_DBG("%s '%s'\n", __func__, path);
+  (void)path;
+  SPIFFS_API_CHECK_CFG(fs);
+  SPIFFS_API_CHECK_MOUNT(fs);
+  return SPIFFS_OK;
+}
+
+/* Remove all files whose names begin with the given directory prefix. */
+s32_t SPIFFS_rmdir(spiffs *fs, const char *path) {
+  SPIFFS_API_DBG("%s '%s'\n", __func__, path);
+#if SPIFFS_READ_ONLY
+  (void)fs;
+  (void)path;
+  return SPIFFS_ERR_RO_NOT_IMPL;
+#else
+  SPIFFS_API_CHECK_CFG(fs);
+  SPIFFS_API_CHECK_MOUNT(fs);
+
+  /* Build prefix with trailing slash */
+  char prefix[SPIFFS_OBJ_NAME_LEN];
+  u32_t plen = 0;
+  if (path) {
+    const char *p = path;
+    while (*p == '/') p++;
+    plen = strlen(p);
+    if (plen >= sizeof(prefix))
+      return SPIFFS_ERR_NAME_TOO_LONG;
+    memcpy(prefix, p, plen);
+    /* Ensure trailing slash */
+    if (plen > 0 && prefix[plen - 1] != '/') {
+      if (plen + 1 >= sizeof(prefix))
+        return SPIFFS_ERR_NAME_TOO_LONG;
+      prefix[plen++] = '/';
+    }
+    prefix[plen] = '\0';
+  }
+
+  if (plen == 0)
+    return SPIFFS_ERR_FULL; /* refuse to delete everything at root */
+
+  /* Iterate raw SPIFFS entries (bypassing directory synthesis) and remove
+   * every file whose flat name begins with the prefix. */
+  spiffs_block_ix bix = 0;
+  int entry = 0;
+  struct spiffs_dirent e;
+
+  while (1) {
+    SPIFFS_LOCK(fs);
+    s32_t res = spiffs_obj_lu_find_entry_visitor(fs, bix, entry,
+        SPIFFS_VIS_NO_WRAP, 0, spiffs_read_dir_v, 0, &e, &bix, &entry);
+    if (res != SPIFFS_OK) {
+      SPIFFS_UNLOCK(fs);
+      break;
+    }
+    e.obj_id &= ~SPIFFS_OBJ_ID_IX_FLAG;
+    entry++;
+    SPIFFS_UNLOCK(fs);
+
+    if (strncmp((const char *)e.name, prefix, plen) == 0) {
+      SPIFFS_remove(fs, (const char *)e.name);
+    }
+  }
+  return SPIFFS_OK;
+#endif
 }
 
 s32_t SPIFFS_check(spiffs *fs) {

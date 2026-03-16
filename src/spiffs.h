@@ -316,10 +316,26 @@ struct spiffs_dirent {
 #endif
 };
 
+/* Maximum number of synthesised directory entries per listing.
+ * Controls the deduplication buffer size inside spiffs_DIR. */
+#ifndef SPIFFS_DIR_MAX_SYNTH_DIRS
+#define SPIFFS_DIR_MAX_SYNTH_DIRS  8
+#endif
+
+/* Maximum prefix length for directory filtering. */
+#ifndef SPIFFS_DIR_PREFIX_LEN
+#define SPIFFS_DIR_PREFIX_LEN      (SPIFFS_OBJ_NAME_LEN)
+#endif
+
 typedef struct {
   spiffs *fs;
   spiffs_block_ix block;
   int entry;
+  /* Directory emulation: prefix filter and deduplication tracking */
+  u8_t prefix[SPIFFS_DIR_PREFIX_LEN];
+  u32_t prefix_len;
+  u8_t seen_dirs[SPIFFS_DIR_MAX_SYNTH_DIRS][SPIFFS_DIR_PREFIX_LEN];
+  u32_t seen_dir_count;
 } spiffs_DIR;
 
 #if SPIFFS_IX_MAP
@@ -576,10 +592,11 @@ void SPIFFS_clearerr(spiffs *fs);
 /**
  * Opens a directory stream corresponding to the given name.
  * The stream is positioned at the first entry in the directory.
- * On hydrogen builds the name argument is ignored as hydrogen builds always correspond
- * to a flat file structure - no directories.
+ * When a non-root path is given (e.g. "images"), SPIFFS_readdir
+ * will filter entries by that prefix and synthesise sub-directory
+ * entries from the flat filename namespace.
  * @param fs            the file system struct
- * @param name          the name of the directory
+ * @param name          the name of the directory (e.g. "/", "images", "images/")
  * @param d             pointer the directory stream to be populated
  */
 spiffs_DIR *SPIFFS_opendir(spiffs *fs, const char *name, spiffs_DIR *d);
@@ -591,12 +608,35 @@ spiffs_DIR *SPIFFS_opendir(spiffs *fs, const char *name, spiffs_DIR *d);
 s32_t SPIFFS_closedir(spiffs_DIR *d);
 
 /**
- * Reads a directory into given spifs_dirent struct.
+ * Reads a directory into given spiffs_dirent struct.
+ * Automatically filters by the prefix set in SPIFFS_opendir and
+ * synthesises SPIFFS_TYPE_DIR entries for unique sub-directory
+ * components found in the flat filenames.
  * @param d             pointer to the directory stream
  * @param e             the dirent struct to be populated
  * @returns null if error or end of stream, else given dirent is returned
  */
 struct spiffs_dirent *SPIFFS_readdir(spiffs_DIR *d, struct spiffs_dirent *e);
+
+/**
+ * Create a directory.  SPIFFS uses a flat namespace so this is a
+ * no-op that always succeeds.  The directory appears implicitly
+ * when files with the corresponding prefix exist.
+ * @param fs            the file system struct
+ * @param path          directory path (ignored)
+ * @returns SPIFFS_OK
+ */
+s32_t SPIFFS_mkdir(spiffs *fs, const char *path);
+
+/**
+ * Remove a directory by deleting every file whose name starts
+ * with the given prefix.  After this call no files with the
+ * prefix remain on flash.
+ * @param fs            the file system struct
+ * @param path          directory path prefix (e.g. "images" or "images/")
+ * @returns SPIFFS_OK on success, negative on error
+ */
+s32_t SPIFFS_rmdir(spiffs *fs, const char *path);
 
 /**
  * Runs a consistency check on given filesystem.
